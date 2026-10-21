@@ -9,6 +9,8 @@ import {
   type CreateAgentRequestOptions,
   type DaemonTransport,
   type Logger,
+  type PluginClientBundle,
+  type PluginClientBundleStore,
 } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
@@ -2025,8 +2027,11 @@ describe("plugin catalog", () => {
   async function fetchCatalog(
     harness: Awaited<ReturnType<typeof connectedClient>>,
     respond: (request: Record<string, unknown>) => Array<Record<string, unknown>>,
+    store?: PluginClientBundleStore,
   ) {
-    const response = harness.client.getPluginCatalog();
+    const before = harness.mock.sent.length;
+    const response = harness.client.getPluginCatalog(store);
+    if (store) await vi.waitFor(() => expect(harness.mock.sent.length).toBeGreaterThan(before));
     const request = parseSentFrame(harness.mock.sent.at(-1));
     harness.mock.triggerMessage(
       wrapSessionMessage({
@@ -2076,6 +2081,68 @@ describe("plugin catalog", () => {
 
     expect(second.request).not.toHaveProperty("cachedClientBundles");
     expect(second.plugins).toEqual([{ id: "legacy", clientBundle: "legacy bundle" }]);
+  });
+
+  test("a fresh client advertises persisted bundles on its first fetch and expands omitted code", async () => {
+    let persisted: PluginClientBundle[] = [];
+    let loads = 0;
+    const store: PluginClientBundleStore = {
+      async load() {
+        loads++;
+        return persisted;
+      },
+      async replace(bundles) {
+        persisted = bundles;
+      },
+    };
+    const bundle = { id: "kept", clientBundleHash: "hash-kept", clientBundle: "stored code" };
+    await fetchCatalog(await connectedClient(), () => [bundle], store);
+    const cold = await connectedClient();
+    const first = await fetchCatalog(
+      cold,
+      () => [{ id: "kept", clientBundleHash: "hash-kept" }],
+      store,
+    );
+    expect(first.request.cachedClientBundles).toEqual([
+      { id: "kept", clientBundleHash: "hash-kept" },
+    ]);
+    expect(first.plugins).toEqual([bundle]);
+    expect(loads).toBe(2);
+    await fetchCatalog(cold, () => [], store);
+    expect(loads).toBe(2);
+    expect(persisted).toEqual([]);
+  });
+
+  test.each(["missing", "unreadable"])(
+    "a %s persistent cache requests full bundles",
+    async (state) => {
+      const store: PluginClientBundleStore = {
+        async load() {
+          if (state === "unreadable") throw new Error("Storage unavailable");
+          return [];
+        },
+        async replace() {},
+      };
+      const bundle = { id: "full", clientBundleHash: "hash-full", clientBundle: "full code" };
+      const result = await fetchCatalog(await connectedClient(), () => [bundle], store);
+      expect(result.request).not.toHaveProperty("cachedClientBundles");
+      expect(result.plugins).toEqual([bundle]);
+    },
+  );
+
+  test("failed cache writes never fail plugin loading", async () => {
+    const store: PluginClientBundleStore = {
+      async load() {
+        return [];
+      },
+      async replace() {
+        throw new Error("Disk full");
+      },
+    };
+    const bundle = { id: "full", clientBundleHash: "hash-full", clientBundle: "full code" };
+    expect((await fetchCatalog(await connectedClient(), () => [bundle], store)).plugins).toEqual([
+      bundle,
+    ]);
   });
 });
 

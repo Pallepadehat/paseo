@@ -394,6 +394,18 @@ export type DaemonEventHandler = (event: DaemonEvent) => void;
 export type BrowserAutomationExecuteRequestMessage = BrowserAutomationExecuteRequest;
 export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteResponse;
 
+export interface PluginClientBundle {
+  id: string;
+  clientBundleHash: string;
+  clientBundle: string;
+}
+
+/** Host-scoped storage. load must return only bundles whose contents have been verified. */
+export interface PluginClientBundleStore {
+  load(): Promise<PluginClientBundle[]>;
+  replace(bundles: PluginClientBundle[]): Promise<void>;
+}
+
 export interface DaemonClientConfig {
   /** Deliver compact bodies/hash references to a caller-owned snapshot cache.
    * The default keeps public SDK snapshot entries expanded. */
@@ -1341,6 +1353,7 @@ export class DaemonClient {
     string,
     { clientBundleHash: string; clientBundle: string }
   >();
+  private pluginClientBundlesLoaded: Promise<void> | undefined;
   private logger: Logger;
   private pendingSendQueue: PendingSend[] = [];
   private readonly logConnectionPath: "direct" | "relay";
@@ -5723,7 +5736,17 @@ export class DaemonClient {
     });
   }
 
-  async getPluginCatalog(): Promise<PluginCatalogEntry[]> {
+  async getPluginCatalog(store?: PluginClientBundleStore): Promise<PluginCatalogEntry[]> {
+    if (store) {
+      this.pluginClientBundlesLoaded ??= store.load().then(
+        (bundles) => {
+          for (const { id, ...bundle } of bundles) this.pluginClientBundles.set(id, bundle);
+          return undefined;
+        },
+        (error) => this.logger.warn({ err: error }, "Failed to load plugin client bundles"),
+      );
+      await this.pluginClientBundlesLoaded;
+    }
     const requestId = this.createRequestId();
     const cached = this.pluginClientBundles;
     const cachedClientBundles = [...cached].map(([id, { clientBundleHash }]) => ({
@@ -5741,7 +5764,12 @@ export class DaemonClient {
     });
     const retained = new Map<string, { clientBundleHash: string; clientBundle: string }>();
     const plugins = payload.plugins.map(({ clientBundle: sent, ...plugin }): PluginCatalogEntry => {
-      const clientBundle = sent ?? cached.get(plugin.id)?.clientBundle;
+      const previous = cached.get(plugin.id);
+      const clientBundle =
+        sent ??
+        (previous?.clientBundleHash === plugin.clientBundleHash
+          ? previous?.clientBundle
+          : undefined);
       if (clientBundle === undefined) {
         throw new Error(`Plugin catalog left out the client bundle for ${plugin.id}`);
       }
@@ -5753,6 +5781,13 @@ export class DaemonClient {
       return Object.assign(plugin, { clientBundle });
     });
     this.pluginClientBundles = retained;
+    if (store) {
+      await store
+        .replace([...retained].map(([id, bundle]) => Object.assign({ id }, bundle)))
+        .catch((error) =>
+          this.logger.warn({ err: error }, "Failed to persist plugin client bundles"),
+        );
+    }
     return plugins;
   }
 
