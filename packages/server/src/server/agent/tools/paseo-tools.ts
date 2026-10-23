@@ -1,6 +1,8 @@
+import type { FinishSubscriptions, FinishRegistration } from "../finish-subscriptions/index.js";
+import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import {
   createHostResolver,
-  waitForPermissionChange,
+  HostOperationRejectedError,
   type HostOperation,
   type HostOperations,
   type ToolHosts,
@@ -76,8 +78,6 @@ import {
 import {
   type PromptDispatchDisposition,
   sendPromptToAgent,
-  setupFinishNotification,
-  setupFinishWait,
   waitForAgentRunStartWithTimeout,
 } from "../agent-prompt.js";
 import { respondToAgentPermission } from "../permission-response.js";
@@ -116,6 +116,8 @@ import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-confi
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 
 export interface PaseoToolHostDependencies {
+  agentMessages?: () => AgentMessageDelivery;
+  finishSubscriptions?: () => FinishSubscriptions;
   serverId?: string;
   hosts?: () => ToolHosts;
   agentManager: AgentManager;
@@ -171,10 +173,6 @@ export interface PaseoToolHostDependencies {
   enableVoiceTools?: boolean;
   voiceOnly?: boolean;
   logger: Logger;
-}
-
-function settledStatus(status: string): "error" | "idle" {
-  return status === "error" ? "error" : "idle";
 }
 
 interface ProviderSummary {
@@ -657,6 +655,53 @@ function createToolCatalog(
     return result.data;
   };
 
+  function agentMessages(): AgentMessageDelivery {
+    if (!options.agentMessages) throw new Error("Agent message delivery is not configured");
+    return options.agentMessages();
+  }
+  function finishSubscriptions(): FinishSubscriptions {
+    if (!options.finishSubscriptions) throw new Error("Finish subscriptions are not configured");
+    return options.finishSubscriptions();
+  }
+  async function prepareRemoteNotification(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+  ): Promise<FinishRegistration | undefined> {
+    if (
+      name !== "send_agent_prompt" ||
+      destination === options.serverId ||
+      !callerAgentId ||
+      input.notifyOnFinish === false
+    )
+      return undefined;
+    return finishSubscriptions().register(
+      { childAgentId: input.agentId as string, callerAgentId, serverId: destination },
+      true,
+    );
+  }
+  async function registerRemoteCreation(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+    response: PaseoToolResult,
+  ): Promise<void> {
+    if (
+      name !== "create_agent" ||
+      destination === options.serverId ||
+      !callerAgentId ||
+      input.notifyOnFinish === false ||
+      response.isError
+    )
+      return;
+    const childAgentId = (response.structuredContent as { agentId: string }).agentId;
+    await finishSubscriptions().register({
+      childAgentId,
+      callerAgentId,
+      serverId: destination,
+      requireParentOwnership: true,
+    });
+  }
   const localHostOperations = new Map<string, HostOperation>();
   const tools = new Map<string, PaseoToolDefinition>();
   const hostTools = new Map([
@@ -685,36 +730,6 @@ function createToolCatalog(
       getStatus: (args, context) => localHostOperations.get("get_agent_status")!(args, context),
       getActivity: (args, context) => localHostOperations.get("get_agent_activity")!(args, context),
       listAgents: (args, context) => localHostOperations.get("list_agents")!(args, context),
-      async observe(agentId, handler, signal) {
-        const unsubscribe = agentManager.subscribe(
-          (event) => {
-            if (event.type === "agent_state") handler(toAgentPayload(event.agent));
-          },
-          { agentId, replayState: true },
-        );
-        const stop = () => unsubscribe();
-        signal.addEventListener("abort", stop, { once: true });
-        return async () => {
-          signal.removeEventListener("abort", stop);
-          unsubscribe();
-        };
-      },
-      async wait(agentId, signal) {
-        const settled = await agentManager.waitForAgentEvent(agentId, {
-          signal,
-          waitForActive: true,
-        });
-        const snapshot = agentManager.getAgent(agentId);
-        const final = snapshot
-          ? await serializeSnapshotWithMetadata(agentStorage, snapshot, childLogger)
-          : null;
-        return {
-          status: settled.permission ? "permission" : settledStatus(settled.status),
-          final,
-          lastMessage: settled.lastMessage,
-          error: final?.lastError ?? null,
-        };
-      },
     },
   });
   const registerTool = (
@@ -746,33 +761,14 @@ function createToolCatalog(
       };
       handler = async ({ serverId, ...input }, context) => {
         const destination = serverId ?? options.serverId;
+        const remoteNotification = await prepareRemoteNotification(name, destination, input);
         try {
           const response = await hostResolver.use(serverId, (host) =>
             host[operation](input, context),
           );
-          let childAgentId: string | undefined;
-          if (name === "create_agent") {
-            childAgentId = (response.structuredContent as { agentId: string }).agentId;
-          } else if (name === "send_agent_prompt" && destination !== options.serverId) {
-            childAgentId = input.agentId as string;
-          }
-          if (childAgentId && callerAgentId && input.notifyOnFinish !== false) {
-            setupFinishWait({
-              agentManager,
-              agentStorage,
-              originServerId: options.serverId,
-              childServerId: destination,
-              childAgentId,
-              callerAgentId,
-              logger: childLogger,
-              wait: (signal) =>
-                hostResolver.use(destination, (host) => host.wait(childAgentId, signal)),
-              afterPermission: (requestId, signal) =>
-                hostResolver.use(destination, (host) =>
-                  waitForPermissionChange(host, childAgentId, requestId, signal),
-                ),
-            });
-          }
+          if (response.isError) await remoteNotification?.reject();
+          else remoteNotification?.accept();
+          await registerRemoteCreation(name, destination, input, response);
           return {
             ...response,
             structuredContent: {
@@ -781,6 +777,11 @@ function createToolCatalog(
             },
           };
         } catch (error) {
+          // A lost response does not establish whether the remote daemon admitted the prompt.
+          // Reconcile the child rather than silently dropping notification intent.
+          if (error instanceof PaseoToolInputError || error instanceof HostOperationRejectedError)
+            await remoteNotification?.reject();
+          else remoteNotification?.accept();
           if (!options.serverId) throw error;
           const failure = {
             serverId: destination,
@@ -1213,7 +1214,7 @@ function createToolCatalog(
       .optional()
       .default(true)
       .describe(
-        "Get notified when the created agent finishes, errors, or needs permission. Set false only for truly fire-and-forget agents.",
+        "Get notified when the created agent finishes, errors, or needs permission. Set false for explicit reporting or no completion callback.",
       ),
   };
   const canonicalTopLevelInputSchema = {
@@ -1274,7 +1275,7 @@ function createToolCatalog(
       .optional()
       .default(true)
       .describe(
-        "Get notified when the prompted agent finishes, errors, or needs permission. Set false only for truly fire-and-forget prompts.",
+        "Get notified when the prompted agent finishes, errors, or needs permission. Set false for explicit reporting or no completion callback.",
       ),
   };
   const topLevelSendAgentPromptInputSchema = {
@@ -1614,6 +1615,7 @@ function createToolCatalog(
         {
           agentManager,
           agentStorage,
+          finishSubscriptions: options.finishSubscriptions?.(),
           logger: childLogger,
           paseoHome: options.paseoHome,
           worktreesRoot: options.worktreesRoot,
@@ -1642,7 +1644,7 @@ function createToolCatalog(
           },
           mode: parsedArgs.settings?.modeId,
           promptFailure: "throw",
-          notifyOnFinish: false,
+          notifyOnFinish,
           detached: resolvedArgs.detached,
           callerAgentId,
           callerContext,
@@ -1941,11 +1943,13 @@ function createToolCatalog(
     {
       title: "Send agent prompt",
       description:
-        "Send a task and return after dispatch acknowledgement. Calling agents receive finish notifications by default.",
+        "Send a task. Agent callers receive an immediate queued receipt; delivery follows after two quiet seconds per recipient. Completion reports include the target’s last response by default. Paseo supplies caller identity.",
       inputSchema: sendAgentPromptInputSchema,
       outputSchema: {
         success: z.boolean(),
         disposition: z.enum(["turn_started", "out_of_band", "steered"]).optional(),
+        deliveryStatus: z.literal("queued").optional(),
+        messageId: z.string().optional(),
         status: AgentStatusEnum,
         guidance: z.string().optional(),
       },
@@ -1957,43 +1961,69 @@ function createToolCatalog(
       notifyOnFinish = Boolean(callerAgentId),
       activeTurnBehavior = callerAgentId ? "steer" : "interrupt",
     }) => {
-      let stopNotification: (() => void) | undefined;
-      let acceptDispatch!: (result: PromptDispatchDisposition | false) => void;
-      const dispatchResult = new Promise<PromptDispatchDisposition | false>((resolve) => {
-        acceptDispatch = resolve;
-      });
-      const notifying = Boolean(callerAgentId && notifyOnFinish);
-      if (callerAgentId && notifyOnFinish) {
-        stopNotification = setupFinishNotification({
-          agentManager,
-          agentStorage,
-          childAgentId: agentId,
-          childServerId: options.serverId,
-          callerAgentId,
-          waitForTurnStart: false,
-          dispatchResult,
-          logger: childLogger,
-        });
+      if (callerAgentId && !agentManager.getAgent(agentId) && !(await agentStorage.get(agentId))) {
+        throw new PaseoToolInputError(`Agent ${agentId} not found`);
       }
-      function confirmDispatch(disposition: PromptDispatchDisposition): void {
-        // A new turn must ignore outcomes from the displaced turn. Its iterator
-        // has not started yet, so rearm here; steering keeps the early observer.
-        if (disposition !== "turn_started") {
-          acceptDispatch(disposition);
-          return;
-        }
-        acceptDispatch(disposition);
-        if (!callerAgentId || !notifyOnFinish) return;
-        stopNotification?.();
-        stopNotification = setupFinishNotification({
-          agentManager,
-          agentStorage,
-          childAgentId: agentId,
-          childServerId: options.serverId,
-          callerAgentId,
-          waitForTurnStart: true,
-          logger: childLogger,
+      const notifying = Boolean(callerAgentId && notifyOnFinish);
+      const notification =
+        notifying && callerAgentId
+          ? await (() => {
+              if (!options.finishSubscriptions)
+                throw new Error("Finish subscriptions are not configured");
+              return options
+                .finishSubscriptions()
+                .register({ childAgentId: agentId, callerAgentId }, true);
+            })()
+          : undefined;
+      function confirmDispatch(_disposition: PromptDispatchDisposition): void {
+        notification?.accept();
+      }
+      function rejectNotification(): void {
+        void notification
+          ?.reject()
+          .catch((error) =>
+            childLogger.error(
+              { err: error, agentId },
+              "Failed to remove rejected finish subscription",
+            ),
+          );
+      }
+
+      if (callerAgentId) {
+        const receipt = (() => {
+          try {
+            return agentMessages().enqueue({
+              recipientId: agentId,
+              prompt,
+              source: {
+                kind: "agent-message",
+                agentId: callerAgentId,
+                title: resolveCallerAgent()?.config.title ?? undefined,
+              },
+              sessionMode,
+              activeTurnBehavior,
+              onDispatch: confirmDispatch,
+            });
+          } catch (error) {
+            rejectNotification();
+            throw error;
+          }
+        })();
+        void receipt.dispatched.catch(() => {
+          rejectNotification();
         });
+        return {
+          content: [],
+          structuredContent: {
+            success: true,
+            deliveryStatus: receipt.status,
+            messageId: receipt.messageId,
+            status: agentManager.getAgent(agentId)?.lifecycle ?? "idle",
+            guidance: notifying
+              ? `Queued for delivery after two quiet seconds. ${PROMPTED_AGENT_NOTIFICATION_GUIDANCE}`
+              : "Queued for delivery after two quiet seconds; provider dispatch has not occurred.",
+          },
+        };
       }
 
       const { disposition } = await sendPromptToAgent({
@@ -2007,8 +2037,7 @@ function createToolCatalog(
         onDispatch: confirmDispatch,
         logger: childLogger,
       }).catch((error) => {
-        acceptDispatch(false);
-        stopNotification?.();
+        rejectNotification();
         if (error instanceof AgentNotFoundError) {
           throw new PaseoToolInputError(error.message);
         }
@@ -2018,7 +2047,7 @@ function createToolCatalog(
       // Return once the provider has accepted the turn, so the status reports it running.
       if (disposition === "turn_started") {
         await waitForAgentRunStartWithTimeout(agentManager, agentId).catch((error) => {
-          stopNotification?.();
+          rejectNotification();
           throw error;
         });
       }
