@@ -1,6 +1,6 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { CryptoDigestAlgorithm, digestStringAsync, randomUUID } from "expo-crypto";
-import { createPluginClientBundleStore } from "./client-bundle-store";
+import { createPluginClientBundleStore } from "./store";
 
 export function createHostPluginClientBundleStore(serverId: string) {
   const directory = `${FileSystem.cacheDirectory}plugin-client-bundles/${encodeURIComponent(serverId)}/`;

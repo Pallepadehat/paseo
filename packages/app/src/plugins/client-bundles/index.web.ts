@@ -1,4 +1,4 @@
-import { createPluginClientBundleStore } from "./client-bundle-store";
+import { createPluginClientBundleStore } from "./store";
 
 const DATABASE_NAME = "paseo-plugin-client-bundles";
 const STORE_NAME = "bundles";

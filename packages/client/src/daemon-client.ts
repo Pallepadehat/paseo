@@ -417,6 +417,8 @@ export interface DaemonClientConfig {
   sessionPermissions?: import("@getpaseo/protocol/messages").DaemonPermission[];
   url: string;
   clientId: string;
+  /** Create one cache for the confirmed daemon identity, retained for this client lifetime. */
+  createPluginClientBundleStore?: (serverId: string) => PluginClientBundleStore;
   clientType?: "mobile" | "browser" | "cli" | "mcp" | "hub";
   appVersion?: string;
   runtimeGeneration?: number | null;
@@ -1363,7 +1365,10 @@ export class DaemonClient {
     string,
     { clientBundleHash: string; clientBundle: string }
   >();
+  private pluginClientBundleStore: PluginClientBundleStore | undefined;
   private pluginClientBundlesLoaded: Promise<void> | undefined;
+  private pluginClientBundlesWrite: PluginClientBundle[] | undefined;
+  private pluginClientBundlesWriting = false;
   private logger: Logger;
   private pendingSendQueue: PendingSend[] = [];
   /**
@@ -5808,7 +5813,13 @@ export class DaemonClient {
     });
   }
 
-  async getPluginCatalog(store?: PluginClientBundleStore): Promise<PluginCatalogEntry[]> {
+  async getPluginCatalog(): Promise<PluginCatalogEntry[]> {
+    if (this.config.createPluginClientBundleStore && !this.pluginClientBundleStore) {
+      const serverInfo = this.getLastServerInfoMessage();
+      if (!serverInfo) throw new Error("Plugin catalog requires a connected host");
+      this.pluginClientBundleStore = this.config.createPluginClientBundleStore(serverInfo.serverId);
+    }
+    const store = this.pluginClientBundleStore;
     if (store) {
       this.pluginClientBundlesLoaded ??= store.load().then(
         (bundles) => {
@@ -5845,8 +5856,8 @@ export class DaemonClient {
       if (clientBundle === undefined) {
         throw new Error(`Plugin catalog left out the client bundle for ${plugin.id}`);
       }
-      // COMPAT(pluginCatalogBundleHash): added in v0.11.3, remove after 2027-04-12 once daemon
-      // floor >= v0.11.3. Older daemons send no hash, so their bundles are never retained.
+      // COMPAT(pluginCatalogBundleHash): introduced by PR #6732 (unreleased); remove after
+      // 2027-04-27 once the daemon floor includes bundle hashes. Older bundles are not retained.
       if (plugin.clientBundleHash !== undefined) {
         retained.set(plugin.id, { clientBundleHash: plugin.clientBundleHash, clientBundle });
       }
@@ -5854,13 +5865,30 @@ export class DaemonClient {
     });
     this.pluginClientBundles = retained;
     if (store) {
-      await store
-        .replace([...retained].map(([id, bundle]) => Object.assign({ id }, bundle)))
-        .catch((error) =>
-          this.logger.warn({ err: error }, "Failed to persist plugin client bundles"),
-        );
+      this.pluginClientBundlesWrite = [...retained].map(([id, bundle]) =>
+        Object.assign({ id }, bundle),
+      );
+      void this.persistPluginClientBundles(store);
     }
     return plugins;
+  }
+
+  private async persistPluginClientBundles(store: PluginClientBundleStore): Promise<void> {
+    if (this.pluginClientBundlesWriting) return;
+    this.pluginClientBundlesWriting = true;
+    try {
+      while (this.pluginClientBundlesWrite) {
+        const bundles = this.pluginClientBundlesWrite;
+        this.pluginClientBundlesWrite = undefined;
+        try {
+          await store.replace(bundles);
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to persist plugin client bundles");
+        }
+      }
+    } finally {
+      this.pluginClientBundlesWriting = false;
+    }
   }
 
   async listPlugins(): Promise<PluginListItem[]> {

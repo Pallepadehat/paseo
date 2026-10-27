@@ -387,11 +387,9 @@ and the daemon's SHA-256. A cold client verifies stored contents before advertis
 missing or corrupt files request full bundles. Only the latest catalog's bundles remain. Hashing
 uses Expo's native async digest on mobile, avoiding a JavaScript hash loop on Hermes; reading and
 passing the bundle string still costs memory and time once per client lifetime.
-
-The initial catalog observation snapshot waits for the viewed-timeline owner's visible catch-up,
-up to three seconds, so a large bundle response does not queue ahead of chat recovery on the
-ordered relay socket. No visible catch-up means no wait. Catalog-change events refresh immediately;
-settings-change events keep invalidating their query directly.
+Persistence runs after catalog reconstruction without delaying installation. One write runs at a
+time; while storage is busy, only the newest pending catalog is kept. A failed write leaves the
+in-memory bundles usable, and a later catalog retries persistence.
 
 When the same plugin contribution exists on multiple hosts, Paseo shows it once in the sidebar and
 adds a host picker to the screen header. The selected host supplies the bundle, RPC transport, and

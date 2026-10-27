@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { expect, test } from "vitest";
-import { createPluginClientBundleStore, type PluginBundleFiles } from "./client-bundle-store";
+import { createPluginClientBundleStore, type PluginBundleFiles } from "./store";
 
 const sha256 = async (contents: string) => createHash("sha256").update(contents).digest("hex");
 
@@ -91,7 +92,6 @@ test("an interrupted atomic write leaves the prior catalog available for a cold 
 test.each(["valid", "corrupt", "missing"])(
   "cold catalog uses a %s persisted bundle correctly",
   async (state) => {
-    const { DaemonClient } = await import("@getpaseo/client/internal/daemon-client");
     const files = new BundleFiles();
     const entry = await bundle("plugin", "good code");
     await createPluginClientBundleStore(files, sha256).replace([entry]);
@@ -104,6 +104,7 @@ test.each(["valid", "corrupt", "missing"])(
       url: "ws://test",
       clientId: "plugin-cache-test",
       reconnect: { enabled: false },
+      createPluginClientBundleStore: () => createPluginClientBundleStore(files, sha256),
       transportFactory: () => ({
         send(data) {
           if (typeof data !== "string") return;
@@ -164,15 +165,13 @@ test.each(["valid", "corrupt", "missing"])(
         false,
       );
       await connecting;
-      expect(await client.getPluginCatalog(createPluginClientBundleStore(files, sha256))).toEqual([
-        entry,
-      ]);
+      expect(await client.getPluginCatalog()).toEqual([entry]);
       if (state === "valid")
         expect(requests[0]?.cachedClientBundles).toEqual([
           { id: entry.id, clientBundleHash: entry.clientBundleHash },
         ]);
       else expect(requests[0]).not.toHaveProperty("cachedClientBundles");
-      expect(await createPluginClientBundleStore(files, sha256).load()).toEqual([entry]);
+      await expect.poll(() => createPluginClientBundleStore(files, sha256).load()).toEqual([entry]);
     } finally {
       await client.close();
     }

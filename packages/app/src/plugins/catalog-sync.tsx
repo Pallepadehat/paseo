@@ -1,13 +1,10 @@
 import { useVoiceAudioEngineOptional } from "@/contexts/voice-context";
 import { pluginSettingsKey } from "./settings/use-settings";
-import { useEffect, useMemo } from "react";
+import { useEffect } from "react";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { pluginRegistry } from "./registry";
-import { useSessionStore } from "@/stores/session-store";
-import { createHostPluginClientBundleStore } from "./client-bundle-storage";
-import { createCatalogRefresh } from "./catalog-refresh";
 
 export function PluginCatalogSync({
   serverId,
@@ -19,8 +16,6 @@ export function PluginCatalogSync({
   const audio = useVoiceAudioEngineOptional();
   const connected = useHostRuntimeIsConnected(serverId);
   const supported = useHostFeature(serverId, "plugins");
-  const timelineSync = useSessionStore((state) => state.sessions[serverId]?.viewedTimelineSync);
-  const bundles = useMemo(() => createHostPluginClientBundleStore(serverId), [serverId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -33,12 +28,10 @@ export function PluginCatalogSync({
       pluginRegistry.removeHost(serverId);
       return;
     }
-    // SessionProvider creates the owner in an effect; observe only after it is published.
-    if (!timelineSync) return;
     const refresh = (replacePluginId?: string) => {
       refreshQueue = refreshQueue.then(() =>
         client
-          .getPluginCatalog(bundles)
+          .getPluginCatalog()
           .then((catalog) => {
             if (!cancelled) {
               pluginRegistry.installCatalog(serverId, catalog, {
@@ -58,23 +51,13 @@ export function PluginCatalogSync({
       );
       return refreshQueue;
     };
-    const catalogRefresh = createCatalogRefresh({
-      catchUp: timelineSync,
-      refresh: (pluginId) => {
-        void refresh(pluginId);
-      },
-      schedule: (task, delay) => {
-        const timer = setTimeout(task, delay);
-        return () => clearTimeout(timer);
-      },
-    });
     const observation = client.observeEvents([
       "status.plugin_catalog_changed",
       "status.plugin_settings_changed",
     ]);
     observation.subscribe({
       snapshot: () => {
-        catalogRefresh.snapshot();
+        void refresh();
       },
       update: (message) => {
         if (message.type !== "status") return;
@@ -89,18 +72,17 @@ export function PluginCatalogSync({
         }
         if (message.payload.status === "plugin_catalog_changed") {
           const pluginId = message.payload.pluginId;
-          if (typeof pluginId === "string") catalogRefresh.changed(pluginId);
+          if (typeof pluginId === "string") void refresh(pluginId);
         }
       },
     });
     return () => {
       cancelled = true;
-      catalogRefresh.dispose();
       void observation
         .release()
         .catch((error) => console.warn("[Plugins] Failed to release catalog", error));
     };
-  }, [audio, bundles, client, connected, serverId, supported, timelineSync]);
+  }, [audio, client, connected, serverId, supported]);
 
   useEffect(() => () => pluginRegistry.removeHost(serverId), [serverId]);
   return null;

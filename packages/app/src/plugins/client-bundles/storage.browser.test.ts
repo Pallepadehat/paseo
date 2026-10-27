@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { createHostPluginClientBundleStore } from "./client-bundle-storage.web";
+import { createHostPluginClientBundleStore } from "./index.web";
 
 async function sha256(contents: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(contents));
