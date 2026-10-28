@@ -160,6 +160,11 @@ import {
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { ScheduleService } from "./schedule/service.js";
 import { DaemonConfigStore, type MutableDaemonConfig } from "./daemon-config-store.js";
+import { ProviderOverrideSchema } from "@getpaseo/protocol/provider-config";
+import {
+  ProviderCliService,
+  type ProviderCliOverride,
+} from "./agent/provider-cli/provider-cli-service.js";
 import { createOrchestrationSkills } from "./orchestration-skills/index.js";
 import {
   resolveReloadableConfig,
@@ -464,6 +469,7 @@ export interface PaseoDaemonConfig {
   downloadTokenTtlMs?: number;
   agentProviderSettings?: AgentProviderRuntimeSettingsMap;
   idleRuntimeCleanup?: boolean;
+  autoUpdateProviders?: boolean;
   providerCatalogRefreshTimeoutMs?: number;
   metadataGeneration?: {
     providers?: Array<{
@@ -594,6 +600,7 @@ function createInitialMutableDaemonConfig(config: ResolvedDaemonSettings): Mutab
     autoArchiveAfterMerge: config.autoArchiveAfterMerge ?? false,
     enableTerminalAgentHooks: config.enableTerminalAgentHooks ?? false,
     idleRuntimeCleanup: config.idleRuntimeCleanup !== false,
+    autoUpdateProviders: config.autoUpdateProviders === true,
     appendSystemPrompt: config.appendSystemPrompt ?? "",
     pluginsEnabled: config.pluginsEnabled ?? false,
     plugins: config.plugins ?? {},
@@ -1497,6 +1504,27 @@ export async function createPaseoDaemon(
     idleRuntimeCleanup,
   );
 
+  const providerCli = new ProviderCliService({
+    logger: logger.child({ module: "provider-cli" }),
+    autoUpdate: daemonConfigStore.get().autoUpdateProviders === true,
+    getProviderOverride: (provider) => readProviderCliOverride(daemonConfigStore, provider),
+    isProviderBusy: (provider) =>
+      agentManager
+        .listAgents({ includeInternal: true })
+        .some((agent) => agent.lifecycle === "running" && agent.provider === provider),
+    onProviderChanged: (provider) => {
+      void providerSnapshotManager
+        .refreshSettingsSnapshot({ providers: [provider] })
+        .catch((err) =>
+          logger.warn({ err, provider }, "Failed to refresh provider after CLI change"),
+        );
+    },
+  });
+  const unsubscribeProviderCliAutoUpdate = daemonConfigStore.onFieldChange(
+    "autoUpdateProviders",
+    (value) => providerCli.setAutoUpdateEnabled(value === true),
+  );
+
   const createAgentToolHostDependencies = (
     runtime: PaseoToolRuntimeContext,
   ): PaseoToolHostDependencies => ({
@@ -1865,6 +1893,7 @@ export async function createPaseoDaemon(
               pluginRuntime,
               orchestrationSkills,
               workspaceLabelService,
+              providerCli,
             );
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
@@ -1958,6 +1987,8 @@ export async function createPaseoDaemon(
     scriptHealthMonitor.stop();
     unsubscribeIdleRuntimeCleanup();
     await idleRuntimeCleanup.close();
+    unsubscribeProviderCliAutoUpdate();
+    providerCli.close();
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     await finishSubscriptions.close();
@@ -2062,6 +2093,15 @@ async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promi
       }
     }),
   );
+}
+
+function readProviderCliOverride(
+  store: DaemonConfigStore,
+  provider: string,
+): ProviderCliOverride | undefined {
+  const parsed = ProviderOverrideSchema.safeParse(store.get().providers?.[provider]);
+  if (!parsed.success) return undefined;
+  return { command: parsed.data.command, env: parsed.data.env };
 }
 
 export function connectIdleRuntimeCleanupConfig(
