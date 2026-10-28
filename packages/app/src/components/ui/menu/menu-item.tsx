@@ -18,6 +18,7 @@ import { Check, CheckCircle } from "lucide-react-native";
 import { AdaptiveTextInput } from "@/components/adaptive-modal-sheet";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { isWeb } from "@/constants/platform";
 import type { Theme } from "@/styles/theme";
 import { MenuDepthProvider, useMenuContext } from "./menu-context";
 import { MENU_ITEM_HEIGHT } from "./menu-geometry";
@@ -303,21 +304,27 @@ export function MenuItem({
     [selected],
   );
 
+  // The overlay focuses the first row on open so arrow keys work, including when the menu was
+  // opened with the mouse. Pressable's `focused` is true for that programmatic focus too, which
+  // left the first row filled while the pointer was on another one. On web the fill follows
+  // `:focus-visible` instead, the browser's own "this focus came from the keyboard" answer.
+  const [focusVisible, setFocusVisible] = useState(false);
+  const handleFocus = useCallback(() => {
+    setFocusVisible(!isWeb || document.activeElement?.matches(":focus-visible") === true);
+  }, []);
+  const handleBlur = useCallback(() => setFocusVisible(false), []);
+
   const itemPressableStyle = useCallback(
-    ({
-      pressed,
-      hovered = false,
-      focused = false,
-    }: PressableStateCallbackType & { hovered?: boolean; focused?: boolean }) => [
+    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => [
       styles.item,
       active ? styles.itemActive : null,
       isDisabled ? styles.itemDisabled : null,
       muted && !isDisabled ? styles.itemMuted : null,
       hovered && !pressed && !isDisabled ? styles.itemHovered : null,
-      focused && !isDisabled ? styles.itemHovered : null,
+      focusVisible && !isDisabled ? styles.itemHovered : null,
       pressed && !isDisabled ? styles.itemPressed : null,
     ],
-    [active, isDisabled, muted],
+    [active, focusVisible, isDisabled, muted],
   );
 
   const itemTextStyle = useMemo(
@@ -344,6 +351,8 @@ export function MenuItem({
       dataSet={itemDataSet}
       disabled={isDisabled}
       onPress={handleItemPress}
+      onFocus={handleFocus}
+      onBlur={handleBlur}
       style={itemPressableStyle}
     >
       {showSelectedCheck ? (
